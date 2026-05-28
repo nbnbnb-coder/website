@@ -1,429 +1,480 @@
-import socket
-import threading
+import asyncio
 import json
-import time
 import random
+import time
+import os
+import websockets
 
-MAP_W = 1000
-MAP_H = 700
-
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 5000))
+MAX_PLAYERS = 4
 PLAYER_SIZE = 40
-ROOM_SIZE = 2
-GAME_TIME = 60
+SPEED = 3
 
-HOUSE_SIZE = 80
-ROCK_SIZE = 50
-TREE_SIZE = 55
+MAP_WIDTH, MAP_HEIGHT = 1000, 700
+GAME_DURATION = 180
 
-POLICE_SPAWN = (80, 80)
-THIEF_SPAWN = (880, 580)
+POLICE = "police"
+THIEF = "thief"
 
-SAFE_RADIUS = 150
+HOUSE = "house"
+ROCK = "rock"
+TREE = "tree"
+WALL = "wall"
 
-rooms = []
-rooms_lock = threading.Lock()
+WAITING = "waiting"
+READY = "ready"
+PLAYING = "playing"
+SPECTATING = "spectating"
 
-
-def send_json(conn, data):
-    try:
-        conn.sendall((json.dumps(data) + "\n").encode())
-    except:
-        pass
-
-
-def rects_overlap(a, b):
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    return not (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
-
-
-def inside_safe_zone(x, y, w, h, sx, sy, radius):
-    safe_rect = (sx - radius, sy - radius, radius * 2, radius * 2)
-    return rects_overlap((x, y, w, h), safe_rect)
+MSG_WAITING = "waiting"
+MSG_START = "start"
+MSG_UPDATE = "update"
+MSG_GAME_OVER = "game_over"
+MSG_JOIN = "join"
+MSG_MOVE = "move"
+MSG_QUIT = "quit"
+MSG_READY = "ready"
+MSG_ERROR = "error"
 
 
-def collides_any(rect, rect_list, padding=0):
-    rx, ry, rw, rh = rect
-    expanded = (rx - padding, ry - padding, rw + padding * 2, rh + padding * 2)
-    for r in rect_list:
-        if rects_overlap(expanded, r):
-            return True
-    return False
+class Player:
+    def __init__(self, id, name, role, websocket=None):
+        self.id = id
+        self.name = name
+        self.role = role
+        self.websocket = websocket
+        self.x = 0
+        self.y = 0
+        self.dx = 0
+        self.dy = 0
+        self.state = WAITING
+        self.ready = False
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "role": self.role,
+            "x": self.x,
+            "y": self.y,
+            "state": self.state,
+            "ready": self.ready
+        }
 
 
-def generate_house_map():
+players = {}
+connections = {}  # websocket -> player_id
+room_id = None
+game_started = False
+game_over = False
+winner = None
+start_time = 0
+map_type = 0
+houses = []
+rocks = []
+trees = []
+walls = []
+
+game_lock = asyncio.Lock()
+
+
+def get_spawn_points(num_players):
+    spawn_points = []
+    if num_players >= 1:
+        spawn_points.append({"id": 1, "role": POLICE, "x": MAP_WIDTH // 2, "y": MAP_HEIGHT // 2})
+    if num_players >= 2:
+        spawn_points.append({"id": 2, "role": THIEF, "x": 100, "y": 100})
+    if num_players >= 3:
+        spawn_points.append({"id": 3, "role": THIEF, "x": MAP_WIDTH - 100, "y": MAP_HEIGHT - 100})
+    if num_players >= 4:
+        spawn_points.append({"id": 4, "role": THIEF, "x": 100, "y": MAP_HEIGHT - 100})
+    return spawn_points
+
+
+def generate_map(selected_map_type=0):
+    global houses, rocks, trees, walls
     houses = []
     rocks = []
     trees = []
-    blocked_rects = []
+    walls = []
 
-    house_count = random.randint(5, 10)
-    rock_count = random.randint(4, 8)
-    tree_count = random.randint(6, 12)
-
-    # خانه‌ها
-    for _ in range(house_count):
-        placed = False
-        for _try in range(120):
-            x = random.randint(40, MAP_W - HOUSE_SIZE - 40)
-            y = random.randint(40, MAP_H - HOUSE_SIZE - 40)
-            rect = (x, y, HOUSE_SIZE, HOUSE_SIZE)
-
-            if inside_safe_zone(x, y, HOUSE_SIZE, HOUSE_SIZE, POLICE_SPAWN[0], POLICE_SPAWN[1], SAFE_RADIUS):
-                continue
-            if inside_safe_zone(x, y, HOUSE_SIZE, HOUSE_SIZE, THIEF_SPAWN[0], THIEF_SPAWN[1], SAFE_RADIUS):
-                continue
-            if collides_any(rect, blocked_rects, padding=10):
-                continue
-
-            houses.append({
-                "x": x,
-                "y": y,
-                "w": HOUSE_SIZE,
-                "h": HOUSE_SIZE,
-                "image": random.randint(1, 3)
-            })
-            blocked_rects.append(rect)
-            placed = True
-            break
-
-    # سنگ‌ها
-    for _ in range(rock_count):
-        placed = False
-        for _try in range(120):
-            x = random.randint(30, MAP_W - ROCK_SIZE - 30)
-            y = random.randint(30, MAP_H - ROCK_SIZE - 30)
-            rect = (x, y, ROCK_SIZE, ROCK_SIZE)
-
-            if inside_safe_zone(x, y, ROCK_SIZE, ROCK_SIZE, POLICE_SPAWN[0], POLICE_SPAWN[1], SAFE_RADIUS):
-                continue
-            if inside_safe_zone(x, y, ROCK_SIZE, ROCK_SIZE, THIEF_SPAWN[0], THIEF_SPAWN[1], SAFE_RADIUS):
-                continue
-            if collides_any(rect, blocked_rects, padding=8):
-                continue
-
-            rocks.append({
-                "x": x,
-                "y": y,
-                "w": ROCK_SIZE,
-                "h": ROCK_SIZE
-            })
-            blocked_rects.append(rect)
-            placed = True
-            break
-
-    # درخت‌ها
-    for _ in range(tree_count):
-        placed = False
-        for _try in range(120):
-            x = random.randint(30, MAP_W - TREE_SIZE - 30)
-            y = random.randint(30, MAP_H - TREE_SIZE - 30)
-            rect = (x, y, TREE_SIZE, TREE_SIZE)
-
-            if inside_safe_zone(x, y, TREE_SIZE, TREE_SIZE, POLICE_SPAWN[0], POLICE_SPAWN[1], SAFE_RADIUS):
-                continue
-            if inside_safe_zone(x, y, TREE_SIZE, TREE_SIZE, THIEF_SPAWN[0], THIEF_SPAWN[1], SAFE_RADIUS):
-                continue
-            if collides_any(rect, blocked_rects, padding=6):
-                continue
-
-            trees.append({
-                "x": x,
-                "y": y,
-                "w": TREE_SIZE,
-                "h": TREE_SIZE
-            })
-            blocked_rects.append(rect)
-            placed = True
-            break
-
-    return houses, rocks, trees
-
-
-def generate_fixed_maze():
-    walls = [
-        {"x": 180, "y": 60,  "w": 20,  "h": 220},
-        {"x": 180, "y": 360, "w": 20,  "h": 220},
-
-        {"x": 360, "y": 140, "w": 20,  "h": 220},
-        {"x": 360, "y": 0,   "w": 20,  "h": 80},
-        {"x": 360, "y": 440, "w": 20,  "h": 220},
-
-        {"x": 540, "y": 60,  "w": 20,  "h": 220},
-        {"x": 540, "y": 360, "w": 20,  "h": 220},
-
-        {"x": 720, "y": 140, "w": 20,  "h": 220},
-        {"x": 720, "y": 0,   "w": 20,  "h": 80},
-        {"x": 720, "y": 440, "w": 20,  "h": 220},
-
-        {"x": 120, "y": 180, "w": 180, "h": 20},
-        {"x": 420, "y": 180, "w": 180, "h": 20},
-        {"x": 700, "y": 180, "w": 180, "h": 20},
-
-        {"x": 120, "y": 500, "w": 180, "h": 20},
-        {"x": 420, "y": 500, "w": 180, "h": 20},
-        {"x": 700, "y": 500, "w": 180, "h": 20},
-    ]
-    return walls
-
-
-def create_room(room_id):
-    return {
-        "id": room_id,
-        "players": [],
-        "started": False,
-        "game_over": False,
-        "winner": None,
-        "time_left": GAME_TIME,
-        "start_time": None,
-        "map_type": None,
-        "houses": [],
-        "rocks": [],
-        "trees": [],
-        "walls": [],
-    }
-
-
-def get_or_create_room():
-    for room in rooms:
-        if not room["started"] and len(room["players"]) < ROOM_SIZE:
-            return room
-    room = create_room(len(rooms) + 1)
-    rooms.append(room)
-    return room
-
-
-def is_colliding_with_map(x, y, room):
-    player_rect = (x, y, PLAYER_SIZE, PLAYER_SIZE)
-
-    if room["map_type"] == 0:
-        for h in room["houses"]:
-            if rects_overlap(player_rect, (h["x"], h["y"], h["w"], h["h"])):
-                return True
-        for r in room["rocks"]:
-            if rects_overlap(player_rect, (r["x"], r["y"], r["w"], r["h"])):
-                return True
-        for t in room["trees"]:
-            if rects_overlap(player_rect, (t["x"], t["y"], t["w"], t["h"])):
-                return True
-
-    elif room["map_type"] == 1:
-        for w in room["walls"]:
-            if rects_overlap(player_rect, (w["x"], w["y"], w["w"], w["h"])):
-                return True
-
-    return False
-
-
-def broadcast_room(room, data):
-    for p in room["players"][:]:
-        send_json(p["conn"], data)
-
-
-def start_game_if_ready(room):
-    if len(room["players"]) == ROOM_SIZE and not room["started"]:
-        room["started"] = True
-        room["game_over"] = False
-        room["winner"] = None
-        room["time_left"] = GAME_TIME
-        room["start_time"] = time.time()
-
-        room["map_type"] = random.randint(0, 1)
-
-        if room["map_type"] == 0:
-            room["houses"], room["rocks"], room["trees"] = generate_house_map()
-            room["walls"] = []
-        else:
-            room["houses"] = []
-            room["rocks"] = []
-            room["trees"] = []
-            room["walls"] = generate_fixed_maze()
-
-        room["players"][0]["role"] = "police"
-        room["players"][0]["x"] = POLICE_SPAWN[0]
-        room["players"][0]["y"] = POLICE_SPAWN[1]
-
-        room["players"][1]["role"] = "thief"
-        room["players"][1]["x"] = THIEF_SPAWN[0]
-        room["players"][1]["y"] = THIEF_SPAWN[1]
-
-        for p in room["players"]:
-            send_json(p["conn"], {
-                "type": "start",
-                "room_id": room["id"],
-                "role": p["role"],
-                "time_left": room["time_left"],
-                "map_type": room["map_type"],
-                "houses": room["houses"],
-                "rocks": room["rocks"],
-                "trees": room["trees"],
-                "walls": room["walls"],
-                "players": [
-                    {
-                        "id": pl["id"],
-                        "role": pl["role"],
-                        "x": pl["x"],
-                        "y": pl["y"]
-                    }
-                    for pl in room["players"]
-                ]
-            })
-
-
-def game_loop():
-    while True:
-        time.sleep(0.05)
-        with rooms_lock:
-            for room in rooms:
-                if not room["started"] or room["game_over"]:
-                    continue
-
-                elapsed = int(time.time() - room["start_time"])
-                left = max(0, GAME_TIME - elapsed)
-
-                if left != room["time_left"]:
-                    room["time_left"] = left
-                    broadcast_room(room, {"type": "timer", "time_left": left})
-
-                police = None
-                thief = None
-
-                for p in room["players"]:
-                    if p["role"] == "police":
-                        police = p
-                    elif p["role"] == "thief":
-                        thief = p
-
-                if police and thief:
-                    if rects_overlap(
-                        (police["x"], police["y"], PLAYER_SIZE, PLAYER_SIZE),
-                        (thief["x"], thief["y"], PLAYER_SIZE, PLAYER_SIZE)
-                    ):
-                        room["game_over"] = True
-                        room["winner"] = "police"
-                        broadcast_room(room, {"type": "game_over", "winner": "police"})
-                        continue
-
-                if room["time_left"] <= 0:
-                    room["game_over"] = True
-                    room["winner"] = "thief"
-                    broadcast_room(room, {"type": "game_over", "winner": "thief"})
-
-
-def remove_player_from_room(room, player_id):
-    room["players"] = [p for p in room["players"] if p["id"] != player_id]
-
-    if len(room["players"]) == 0:
-        room["started"] = False
-        room["game_over"] = False
-        room["winner"] = None
-        room["time_left"] = GAME_TIME
-        room["start_time"] = None
-        room["map_type"] = None
-        room["houses"] = []
-        room["rocks"] = []
-        room["trees"] = []
-        room["walls"] = []
+    if selected_map_type == 1:
+        houses = [
+            {"type": 1, "x": 150, "y": 150},
+            {"type": 2, "x": 300, "y": 200},
+            {"type": 3, "x": 500, "y": 100},
+            {"type": 1, "x": 700, "y": 150},
+            {"type": 2, "x": 850, "y": 200}
+        ]
+        rocks = [{"x": 400, "y": 300}, {"x": 600, "y": 300}]
+        trees = [{"x": 200, "y": 400}, {"x": 800, "y": 400}]
+        walls = [{"x": 500, "y": 400, "width": 20, "height": 150}]
     else:
-        if room["started"] and not room["game_over"]:
-            room["game_over"] = True
-            remain_role = room["players"][0]["role"]
-            winner = "thief" if remain_role == "thief" else "police"
-            broadcast_room(room, {"type": "game_over", "winner": winner})
+        houses = [
+            {"type": 1, "x": 200, "y": 200},
+            {"type": 2, "x": 800, "y": 200},
+            {"type": 3, "x": 500, "y": 400}
+        ]
+        rocks = [{"x": 300, "y": 300}, {"x": 700, "y": 300}]
+        trees = [{"x": 100, "y": 400}, {"x": 900, "y": 400}]
+        walls = [{"x": 500, "y": 500, "width": 20, "height": 150}]
 
 
-def handle_client(conn, addr, player_id):
-    room = get_or_create_room()
+async def safe_send(ws, message):
+    try:
+        await ws.send(json.dumps(message))
+        return True
+    except:
+        return False
 
-    player = {
-        "id": player_id,
-        "conn": conn,
-        "addr": addr,
-        "x": 0,
-        "y": 0,
-        "role": None
+
+async def broadcast(message, sender_id=None):
+    async with game_lock:
+        targets = []
+        for player_id, player in players.items():
+            if player_id != sender_id and player.websocket:
+                targets.append((player_id, player.websocket))
+
+    to_remove = []
+    for player_id, ws in targets:
+        ok = await safe_send(ws, message)
+        if not ok:
+            to_remove.append(player_id)
+
+    for player_id in to_remove:
+        await remove_player(player_id)
+
+
+async def send_to_player(player_id, message):
+    async with game_lock:
+        player = players.get(player_id)
+        if not player or not player.websocket:
+            return
+        ws = player.websocket
+
+    ok = await safe_send(ws, message)
+    if not ok:
+        await remove_player(player_id)
+
+
+async def get_player_by_conn(ws):
+    async with game_lock:
+        player_id = connections.get(ws)
+        if player_id:
+            return players.get(player_id)
+        return None
+
+
+async def update_waiting_list():
+    async with game_lock:
+        player_dicts = [p.to_dict() for p in players.values() if p.state == WAITING]
+        current_room_id = room_id
+
+    waiting_info = {
+        "type": MSG_WAITING,
+        "room_id": current_room_id,
+        "players": player_dicts
     }
+    await broadcast(waiting_info)
 
-    with rooms_lock:
-        room["players"].append(player)
-        send_json(conn, {
-            "type": "waiting",
-            "room_id": room["id"],
-            "player_number": len(room["players"])
-        })
-        start_game_if_ready(room)
 
-    buffer = ""
+async def remove_player(player_id):
+    global game_started
+
+    should_update_waiting = False
+    should_check_end = False
+
+    async with game_lock:
+        if player_id not in players:
+            return
+
+        player = players[player_id]
+        ws_to_remove = player.websocket
+
+        if ws_to_remove in connections:
+            del connections[ws_to_remove]
+
+        del players[player_id]
+
+        if game_started:
+            should_check_end = True
+        else:
+            should_update_waiting = True
+
+    if game_started:
+        await broadcast({
+            "type": MSG_UPDATE,
+            "players": [p.to_dict() for p in list(players.values())],
+            "time_left": 0
+        }, sender_id=player_id)
+
+    if should_check_end:
+        async with game_lock:
+            active_players = [p for p in players.values() if p.state == PLAYING]
+
+        if len(active_players) < 2:
+            await end_game(active_players[0].id if active_players else None)
+
+    elif should_update_waiting:
+        await update_waiting_list()
+
+
+async def start_game():
+    global game_started, game_over, winner, start_time, map_type
+
+    async with game_lock:
+        if game_started or game_over:
+            return
+
+        ready_players = [p for p in players.values() if p.ready]
+        if len(ready_players) < 2:
+            return
+
+        police_player = ready_players[0]
+        thief_players = ready_players[1:]
+
+        spawn_points = get_spawn_points(len(ready_players))
+
+        police_player.role = POLICE
+        police_player.state = PLAYING
+        if len(spawn_points) > 0:
+            police_player.x = spawn_points[0]["x"]
+            police_player.y = spawn_points[0]["y"]
+
+        for i, thief in enumerate(thief_players, start=1):
+            thief.role = THIEF
+            thief.state = PLAYING
+            if i < len(spawn_points):
+                thief.x = spawn_points[i]["x"]
+                thief.y = spawn_points[i]["y"]
+            else:
+                thief.x, thief.y = 100, 100
+
+        map_type = random.randint(0, 1)
+        generate_map(map_type)
+
+        game_started = True
+        game_over = False
+        winner = None
+        start_time = time.time()
+
+        current_players = list(players.values())
+        current_room_id = room_id
+        current_map_type = map_type
+        current_houses = houses
+        current_rocks = rocks
+        current_trees = trees
+        current_walls = walls
+
+    for target_player in current_players:
+        start_message = {
+            "type": MSG_START,
+            "room_id": current_room_id,
+            "role": target_player.role,
+            "players": [p.to_dict() for p in current_players],
+            "time_left": GAME_DURATION,
+            "map_type": current_map_type,
+            "houses": current_houses,
+            "rocks": current_rocks,
+            "trees": current_trees,
+            "walls": current_walls
+        }
+        await send_to_player(target_player.id, start_message)
+
+
+async def end_game(winning_player_id=None):
+    global game_over, winner, game_started
+
+    async with game_lock:
+        if game_over:
+            return
+
+        game_over = True
+        game_started = False
+
+        if winning_player_id and winning_player_id in players:
+            winner = players[winning_player_id].name
+        else:
+            active_thieves = [p for p in players.values() if p.state == PLAYING and p.role == THIEF]
+            if not active_thieves:
+                winner = "Police Won!"
+            else:
+                winner = "Police Won!"
+
+        end_message = {
+            "type": MSG_GAME_OVER,
+            "winner": winner
+        }
+
+    await broadcast(end_message)
+
+
+async def handle_message(player, msg):
+    global room_id
+
+    msg_type = msg.get("type")
+
+    async with game_lock:
+        if game_over and msg_type != MSG_QUIT:
+            return
+
+        if player.id not in players:
+            if msg_type == MSG_JOIN:
+                player.name = msg.get("name", f"Player_{player.id}")
+                players[player.id] = player
+                connections[player.websocket] = player.id
+                if room_id is None:
+                    room_id = random.randint(1000, 9999)
+                player.state = WAITING
+                player.ready = False
+
+                waiting_message = {
+                    "type": MSG_WAITING,
+                    "room_id": room_id,
+                    "players": [p.to_dict() for p in players.values()]
+                }
+            else:
+                waiting_message = None
+
+        else:
+            waiting_message = None
+
+    if player.id not in players:
+        if msg_type == MSG_JOIN:
+            await send_to_player(player.id, waiting_message)
+            await update_waiting_list()
+        else:
+            await safe_send(player.websocket, {
+                "type": MSG_ERROR,
+                "message": "Please join the game first."
+            })
+            await remove_player(player.id)
+        return
+
+    async with game_lock:
+        current_player = players[player.id]
+
+        if msg_type == MSG_READY:
+            if not game_started and current_player.state == WAITING:
+                current_player.ready = not current_player.ready
+                trigger_waiting_update = True
+                trigger_start = True
+            else:
+                trigger_waiting_update = False
+                trigger_start = False
+
+        elif msg_type == MSG_MOVE:
+            if game_started and current_player.state == PLAYING:
+                current_player.dx = msg.get("dx", 0)
+                current_player.dy = msg.get("dy", 0)
+            trigger_waiting_update = False
+            trigger_start = False
+
+        elif msg_type == MSG_QUIT:
+            trigger_waiting_update = False
+            trigger_start = False
+            should_remove = True
+        else:
+            trigger_waiting_update = False
+            trigger_start = False
+            should_remove = False
+            return
+
+    if msg_type == MSG_READY:
+        if trigger_waiting_update:
+            await update_waiting_list()
+        if trigger_start:
+            await start_game()
+
+    elif msg_type == MSG_QUIT:
+        await remove_player(player.id)
+
+
+async def handle_client(ws):
+    player_id = random.randint(1000, 9999)
+    temp_player = Player(id=player_id, name="Guest", role=None, websocket=ws)
 
     try:
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
+        async for message in ws:
+            try:
+                msg = json.loads(message)
+                await handle_message(temp_player, msg)
 
-            buffer += data.decode()
+                async with game_lock:
+                    if temp_player.id in players:
+                        temp_player = players[temp_player.id]
 
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
+            except json.JSONDecodeError:
+                print("Received invalid JSON")
+            except Exception as e:
+                print(f"Error handling message: {e}")
 
-                msg = json.loads(line)
-
-                if msg["type"] == "move":
-                    with rooms_lock:
-                        if not room["started"] or room["game_over"]:
-                            continue
-
-                        nx = max(0, min(MAP_W - PLAYER_SIZE, int(msg["x"])))
-                        ny = max(0, min(MAP_H - PLAYER_SIZE, int(msg["y"])))
-
-                        if not is_colliding_with_map(nx, ny, room):
-                            player["x"] = nx
-                            player["y"] = ny
-
-                        broadcast_room(room, {
-                            "type": "state",
-                            "players": [
-                                {
-                                    "id": pl["id"],
-                                    "role": pl["role"],
-                                    "x": pl["x"],
-                                    "y": pl["y"]
-                                }
-                                for pl in room["players"]
-                            ],
-                            "time_left": room["time_left"]
-                        })
-    except:
+    except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        with rooms_lock:
-            remove_player_from_room(room, player_id)
-        conn.close()
+        player_to_remove = await get_player_by_conn(ws)
+        if player_to_remove:
+            await remove_player(player_to_remove.id)
 
 
-def main(HOST="0.0.0.0", PORT=5000):
-    threading.Thread(target=game_loop, daemon=True).start()
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
-    server.listen()
-    print(f"Server started on {HOST}:{PORT}")
-
-    next_player_id = 1
+async def game_loop():
+    global game_started, game_over
 
     while True:
-        conn, addr = server.accept()
-        print("Connected:", addr)
-        threading.Thread(
-            target=handle_client,
-            args=(conn, addr, next_player_id),
-            daemon=True
-        ).start()
-        next_player_id += 1
+        await asyncio.sleep(1.0 / 10)
+
+        should_end = None
+        should_broadcast = None
+
+        async with game_lock:
+            if game_started and not game_over:
+                current_time = time.time()
+                time_left = GAME_DURATION - (current_time - start_time)
+
+                active_players = []
+                for player in players.values():
+                    if player.state == PLAYING:
+                        player.x += player.dx * SPEED * (1.0 / 10)
+                        player.y += player.dy * SPEED * (1.0 / 10)
+
+                        player.x = max(PLAYER_SIZE // 2, min(MAP_WIDTH - PLAYER_SIZE // 2, player.x))
+                        player.y = max(PLAYER_SIZE // 2, min(MAP_HEIGHT - PLAYER_SIZE // 2, player.y))
+
+                        active_players.append(player)
+
+                if time_left <= 0:
+                    should_end = None
+                elif len(active_players) < 2:
+                    should_end = active_players[0].id if active_players else None
+                elif len(active_players) == 1 and active_players[0].role == THIEF:
+                    should_end = active_players[0].id
+
+                if not should_end and time_left > 0:
+                    should_broadcast = {
+                        "type": MSG_UPDATE,
+                        "players": [p.to_dict() for p in players.values()],
+                        "time_left": max(0, int(time_left))
+                    }
+
+        if should_end is not None or (should_end is None and game_started and not game_over and should_broadcast is None):
+            await end_game(should_end)
+        elif should_broadcast:
+            await broadcast(should_broadcast)
+
+
+async def main():
+    global room_id
+    room_id = random.randint(1000, 9999)
+    print(f"Server starting on {HOST}:{PORT}")
+    print(f"Initial Room ID: {room_id}")
+
+    asyncio.create_task(game_loop())
+
+    async with websockets.serve(handle_client, HOST, PORT):
+        print("WebSocket server is running...")
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
